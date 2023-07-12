@@ -8,3 +8,6 @@ pom.xml.asc
 /.lein-*
 /.nrepl-port
 tmp/
+.clj-kondo/.cache
+.cpcache
+.lsp

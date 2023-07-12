@@ -9,6 +9,8 @@
             [ring.middleware.keyword-params :as keyword-params]
             [ring.middleware.nested-params :as nested-params]
             fipp.edn
+            [io.pedestal.http :as http]
+            [io.pedestal.interceptor :refer [interceptor]]
 
             [clojure-miniprofiler.types :as types]
             [clojure-miniprofiler.store :as store]))
@@ -307,7 +309,9 @@
   [id options]
   (let [resource (response/resource-response "share.html")
         result   (store/fetch (:store options) id)]
-    {:body
+    {:status  200
+     :headers {"Content-Type" "text/html"}
+     :body
      (reduce
        (fn [result [k v]]
          (string/replace result (re-pattern (str "\\{" k "\\}")) (string/re-quote-replacement (str v))))
@@ -392,9 +396,11 @@
       (let [nested (-> with-params
                        nested-params/nested-params-request
                        keyword-params/keyword-params-request)
-            result (add-client-results nested (store/fetch (:store options) id))]
-        {:headers {"content-type" "application/json"}
-         :body    (json/generate-string result)})
+            result (add-client-results nested (store/fetch (:store options) id))
+            resp   {:headers {"content-type" "application/json"}
+                    :body    (json/generate-string result)
+                    :status  200}]
+        resp)
       (render-share id options))))
 
 
@@ -500,3 +506,65 @@
 
         :else
         (handler req)))))
+
+
+(defn init-miniprofiler-req [context options]
+  (let [t0           (System/nanoTime)
+        miniprofiler (create-miniprofiler (:request context) (or (:initial-opts options) (assert false)))]
+    (-> context
+        (assoc-in [:miniprofiler :t0] t0)
+        (assoc-in [:miniprofiler :options] options)
+        (assoc-in [:bindings #'*current-miniprofiler*] (atom miniprofiler)))))
+
+(defn init-miniprofiler-resp [context]
+  (let [t1                     (System/nanoTime)
+        t0                     (-> context :miniprofiler :t0)
+        options                (-> context :miniprofiler :options)
+        *current-miniprofiler* (get-in context [:bindings #'*current-miniprofiler*])
+        duration               (distance-of-ns-time t0 t1)
+        reconstructed-profile  (reconstruct-profile @*current-miniprofiler* duration)
+        _                      (store/save (:store options)
+                                 (types/to-miniprofiler-map reconstructed-profile))
+        profile-id             (:id reconstructed-profile)
+
+        response (:response context)]
+    (if-let [ctype (get-in context [:response :headers "Content-Type"])]
+      (condp re-matches ctype
+        #".*text/html.*"        (assoc context :response (build-miniprofiler-response-html response duration profile-id options))
+        #".*application/json.*" (assoc context :response (build-miniprofiler-response-json response duration profile-id options))
+        context)
+      context)))
+
+
+(defn miniprofiler-interceptor [opts]
+  (let [options (types/map->Options (default-options opts))]
+    (interceptor
+      {:name  ::miniprofiler-interceptor
+       :enter (fn [context]
+                (let [authorized? (:authorized? options)
+                      req         (:request context)]
+                  (cond
+                    (not (authorized? req))
+                    context
+
+                    (miniprofiler-resource-path req options)
+                    (assoc context :response (respond-with-asset req (miniprofiler-resource-path req options)))
+
+                    (miniprofiler-results-request? req options)
+                    (assoc context :response (miniprofiler-results-response req options))
+
+                    (profile-request? req options)
+                    (init-miniprofiler-req context options)
+
+                    :else
+                    context)))
+       :leave (fn [context]
+                (if (get-in context [:bindings #'*current-miniprofiler*])
+                  (init-miniprofiler-resp context)
+                  context))})))
+
+
+(defn with-miniprofiler [service-map opts]
+  (let [sm (update service-map ::http/interceptors
+             #(vec (cons (miniprofiler-interceptor opts) %)))]
+    sm))
