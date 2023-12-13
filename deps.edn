@@ -1,4 +1,4 @@
-{:paths ["src" "resources"]
+{:paths ["src" "resources" "resources1"]
  :deps  {org.clojure/clojure          {:mvn/version "1.11.1"}
          cheshire/cheshire            {:mvn/version "5.10.1"}
          ring/ring-core               {:mvn/version "1.9.4"}
